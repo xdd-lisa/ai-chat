@@ -13,32 +13,52 @@ type Message = {
   content: string;
 };
 
-const PRD_KEYWORDS = [
-  "原型",
-  "PRD",
-  "需求文档",
-  "产品文档",
-  "产品需求",
-  "功能设计",
-  "需求设计",
-  "写个需求",
-  "写个PRD",
-  "生成文档",
-];
+type DocFile = {
+  name: string;
+  displayName: string;
+  updatedAt: string;
+};
 
-function detectPRD(text: string): boolean {
-  return PRD_KEYWORDS.some((kw) => text.includes(kw));
+const PRD_CREATE_PATTERN =
+  /(生成|创建|新增|新加|写|做|出)(个|一个|一份|一篇)?(原型|PRD|prd|需求文档|产品文档|产品需求|功能设计|需求设计|需求)/;
+
+const PRD_EDIT_PATTERN =
+  /(修改|更新|编辑|改|调整|完善|补充)(一下|下)?(原型|PRD|prd|需求文档|产品文档|产品需求|功能设计|需求设计|需求)/;
+
+type InputMode = "chat" | "create" | "edit";
+
+function detectMode(text: string): InputMode {
+  if (PRD_CREATE_PATTERN.test(text)) return "create";
+  if (PRD_EDIT_PATTERN.test(text)) return "edit";
+  return "chat";
 }
 
-function parsePRDSavePath(content: string): string | null {
-  const match = content.match(/\[PRD_SAVED]\s*(.+)/);
-  return match ? match[1].trim() : null;
+function parseSaveMarker(content: string): string | null {
+  const m =
+    content.match(/\[PRD_SAVED]\s*(.+)/) ||
+    content.match(/\[DOC_UPDATED]\s*(.+)/);
+  return m ? m[1].trim() : null;
 }
 
-function formatDisplayContent(content: string): string {
+function stripMarkers(content: string): string {
   return content
     .replace(/\n---\n\[PRD_SAVED]\s*.+/, "")
-    .replace(/\n---\n\[PRD_SAVE_FAILED]\s*.+/, "");
+    .replace(/\n---\n\[PRD_SAVE_FAILED]\s*.+/, "")
+    .replace(/\n---\n\[DOC_UPDATED]\s*.+/, "")
+    .replace(/\n---\n\[DOC_UPDATE_FAILED]\s*.+/, "");
+}
+
+function formatTime(iso: string): string {
+  const d = new Date(iso);
+  const pad = (n: number) => String(n).padStart(2, "0");
+  return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())} ${pad(d.getHours())}:${pad(d.getMinutes())}`;
+}
+
+function findMatchingDoc(input: string, docs: DocFile[]): DocFile | null {
+  for (const doc of docs) {
+    if (input.includes(doc.displayName)) return doc;
+  }
+  return null;
 }
 
 export default function ChatPage() {
@@ -47,16 +67,131 @@ export default function ChatPage() {
   const [isLoading, setIsLoading] = useState(false);
   const [error, setError] = useState("");
   const [savedPath, setSavedPath] = useState<string | null>(null);
-  const [isPRDGenerating, setIsPRDGenerating] = useState(false);
+  const [activeMode, setActiveMode] = useState<InputMode>("chat");
+  const [docList, setDocList] = useState<DocFile[] | null>(null);
 
   const messagesEndRef = useRef<HTMLDivElement>(null);
 
-  const prdDetected = useMemo(() => detectPRD(inputValue), [inputValue]);
+  const currentMode = useMemo(() => detectMode(inputValue), [inputValue]);
 
-  // biome-ignore lint/correctness/useExhaustiveDependencies: scroll whenever messages array changes
+  // biome-ignore lint/correctness/useExhaustiveDependencies: scroll whenever messages/docList change
   useEffect(() => {
     messagesEndRef.current?.scrollIntoView({ behavior: "smooth" });
-  }, [messages]);
+  }, [messages, docList]);
+
+  async function streamResponse(
+    url: string,
+    body: object,
+    onDone: (fullText: string) => void,
+  ) {
+    const response = await fetch(url, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(body),
+    });
+
+    if (!response.ok) {
+      let errorMsg = `请求失败 (${response.status})`;
+      try {
+        const errorData = await response.json();
+        errorMsg = errorData.error || errorMsg;
+      } catch {
+        // non-JSON
+      }
+      throw new Error(errorMsg);
+    }
+
+    const reader = response.body?.getReader();
+    if (!reader) throw new Error("无法读取响应流");
+
+    const decoder = new TextDecoder();
+    let assistantContent = "";
+
+    setMessages((prev) => [...prev, { role: "assistant", content: "" }]);
+
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+
+      const chunk = decoder.decode(value);
+      assistantContent += chunk;
+
+      setMessages((prev) =>
+        prev.map((msg, idx) =>
+          idx === prev.length - 1 ? { ...msg, content: assistantContent } : msg,
+        ),
+      );
+    }
+
+    if (!assistantContent) throw new Error("未收到有效回复，请重试");
+    onDone(assistantContent);
+  }
+
+  const handleEditMode = async (content: string) => {
+    const newUserMessage: Message = { role: "user", content };
+    setMessages((prev) => [...prev, newUserMessage]);
+    setInputValue("");
+    setIsLoading(true);
+    setActiveMode("edit");
+    setDocList(null);
+    setSavedPath(null);
+
+    try {
+      const res = await fetch("/api/docs");
+      if (!res.ok) throw new Error("获取文档列表失败");
+      const data = await res.json();
+      const files: DocFile[] = data.files;
+
+      if (files.length === 0) {
+        setMessages((prev) => [
+          ...prev,
+          {
+            role: "assistant",
+            content: "当前 Docs 目录下没有文档。请先生成一份需求文档。",
+          },
+        ]);
+        return;
+      }
+
+      const matched = findMatchingDoc(content, files);
+
+      if (matched) {
+        setMessages((prev) => [
+          ...prev,
+          {
+            role: "assistant",
+            content: `正在用 AI 修改文档「${matched.displayName}」...`,
+          },
+        ]);
+
+        setMessages((prev) => prev.slice(0, -1));
+
+        await streamResponse(
+          "/api/update-doc",
+          { filename: matched.name, instructions: content },
+          (fullText) => {
+            const path = parseSaveMarker(fullText);
+            if (path) setSavedPath(path);
+          },
+        );
+      } else {
+        setMessages((prev) => [
+          ...prev,
+          {
+            role: "assistant",
+            content: "未能从输入中匹配到具体文档名称，请选择要编辑的文档：",
+          },
+        ]);
+        setDocList(files);
+      }
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : "操作失败";
+      setError(msg);
+    } finally {
+      setIsLoading(false);
+      setActiveMode("chat");
+    }
+  };
 
   const sendMessage = async () => {
     const content = inputValue.trim();
@@ -64,78 +199,40 @@ export default function ChatPage() {
 
     setError("");
     setSavedPath(null);
+    setDocList(null);
 
-    const isPRD = detectPRD(content);
+    const mode = detectMode(content);
+
+    if (mode === "edit") {
+      return handleEditMode(content);
+    }
+
+    const isPRD = mode === "create";
 
     const newUserMessage: Message = { role: "user", content };
     const newMessages = [...messages, newUserMessage];
     setMessages(newMessages);
     setInputValue("");
     setIsLoading(true);
-    if (isPRD) setIsPRDGenerating(true);
+    if (isPRD) setActiveMode("create");
 
     try {
       const url = isPRD ? "/api/generate-prd" : "/api/chat";
-      const body = isPRD
-        ? JSON.stringify({ description: content })
-        : JSON.stringify({ messages: newMessages });
+      const body = isPRD ? { description: content } : { messages: newMessages };
 
-      const response = await fetch(url, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body,
-      });
-
-      if (!response.ok) {
-        let errorMsg = `请求失败 (${response.status})`;
-        try {
-          const errorData = await response.json();
-          errorMsg = errorData.error || errorMsg;
-        } catch {
-          // non-JSON response
+      await streamResponse(url, body, (fullText) => {
+        if (isPRD) {
+          const path = parseSaveMarker(fullText);
+          if (path) setSavedPath(path);
         }
-        throw new Error(errorMsg);
-      }
-
-      const reader = response.body?.getReader();
-      if (!reader) throw new Error("无法读取响应流");
-
-      const decoder = new TextDecoder();
-      let assistantContent = "";
-
-      setMessages((prev) => [...prev, { role: "assistant", content: "" }]);
-
-      while (true) {
-        const { done, value } = await reader.read();
-        if (done) break;
-
-        const chunk = decoder.decode(value);
-        assistantContent += chunk;
-
-        setMessages((prev) =>
-          prev.map((msg, idx) =>
-            idx === prev.length - 1
-              ? { ...msg, content: assistantContent }
-              : msg,
-          ),
-        );
-      }
-
-      if (!assistantContent) {
-        throw new Error("未收到有效回复，请重试");
-      }
-
-      if (isPRD) {
-        const path = parsePRDSavePath(assistantContent);
-        if (path) setSavedPath(path);
-      }
+      });
     } catch (err) {
       const errorMsg = err instanceof Error ? err.message : "发送消息失败";
       setError(errorMsg);
       setMessages(newMessages);
     } finally {
       setIsLoading(false);
-      setIsPRDGenerating(false);
+      setActiveMode("chat");
     }
   };
 
@@ -148,15 +245,57 @@ export default function ChatPage() {
 
   const renderMessageContent = (msg: Message) => {
     const display =
-      msg.role === "assistant"
-        ? formatDisplayContent(msg.content)
-        : msg.content;
+      msg.role === "assistant" ? stripMarkers(msg.content) : msg.content;
 
     if (!display && msg.role === "assistant" && isLoading) {
-      return isPRDGenerating ? "正在生成PRD文档..." : "思考中...";
+      if (activeMode === "create") return "正在生成PRD文档...";
+      if (activeMode === "edit") return "正在修改文档...";
+      return "思考中...";
     }
     return display;
   };
+
+  const badgeConfig: Record<
+    InputMode,
+    { text: string; bg: string; color: string; border: string } | null
+  > = {
+    chat: null,
+    create: {
+      text: "将以 PRD 模式生成需求文档并保存到 Docs 目录",
+      bg: "#f9f0ff",
+      color: "#722ed1",
+      border: "#efdbff",
+    },
+    edit: {
+      text: "AI 将自动识别并修改对应的需求文档",
+      bg: "#e6f7ff",
+      color: "#096dd9",
+      border: "#91d5ff",
+    },
+  };
+
+  const badge = badgeConfig[currentMode];
+
+  const buttonLabel = isLoading
+    ? activeMode === "create"
+      ? "生成中..."
+      : activeMode === "edit"
+        ? "修改中..."
+        : "发送中..."
+    : currentMode === "create"
+      ? "生成PRD"
+      : currentMode === "edit"
+        ? "AI修改"
+        : "发送";
+
+  const buttonColor =
+    isLoading || !inputValue.trim()
+      ? "#b0c4de"
+      : currentMode === "create"
+        ? "#722ed1"
+        : currentMode === "edit"
+          ? "#096dd9"
+          : "#1890ff";
 
   return (
     <div style={styles.container}>
@@ -168,7 +307,9 @@ export default function ChatPage() {
             <div style={styles.emptyState}>
               <div>输入消息开始聊天吧</div>
               <div style={styles.emptyHint}>
-                输入含「原型」「PRD」「需求文档」等关键字可自动生成PRD文档
+                「生成/创建 + 需求文档」自动生成PRD
+                <br />
+                「修改/更新 + 文档名 + 修改内容」AI 自动修改并保存
               </div>
             </div>
           ) : (
@@ -203,10 +344,41 @@ export default function ChatPage() {
             ))
           )}
 
+          {docList && docList.length > 0 && (
+            <div style={styles.docListCard}>
+              {docList.map((doc) => (
+                <a
+                  key={doc.name}
+                  href={`/docs/${encodeURIComponent(doc.name)}`}
+                  target="_blank"
+                  rel="noopener noreferrer"
+                  style={styles.docItem}
+                >
+                  <span style={styles.docIcon}>&#128196;</span>
+                  <span style={styles.docName}>{doc.displayName}</span>
+                  <span style={styles.docTime}>
+                    {formatTime(doc.updatedAt)}
+                  </span>
+                  <span style={styles.docArrow}>&#8594;</span>
+                </a>
+              ))}
+            </div>
+          )}
+
           {savedPath && (
             <div style={styles.savedBanner}>
               <span style={styles.savedIcon}>&#9989;</span>
-              PRD文档已保存至：<strong>{savedPath}</strong>
+              <span>
+                文档已保存至：<strong>{savedPath}</strong>
+              </span>
+              <a
+                href={`/docs/${encodeURIComponent(savedPath.replace(/^Docs\//, ""))}`}
+                target="_blank"
+                rel="noopener noreferrer"
+                style={styles.previewLink}
+              >
+                预览 &amp; 编辑
+              </a>
             </div>
           )}
 
@@ -220,10 +392,17 @@ export default function ChatPage() {
         )}
 
         <div style={styles.inputArea}>
-          {prdDetected && !isLoading && (
-            <div style={styles.prdBadge}>
-              <span style={styles.prdBadgeIcon}>&#128196;</span>
-              将以 PRD 模式生成需求文档并保存到 Docs 目录
+          {badge && !isLoading && (
+            <div
+              style={{
+                ...styles.modeBadge,
+                backgroundColor: badge.bg,
+                color: badge.color,
+                borderBottomColor: badge.border,
+              }}
+            >
+              <span style={styles.modeBadgeIcon}>&#128196;</span>
+              {badge.text}
             </div>
           )}
           <div style={styles.inputContainer}>
@@ -242,23 +421,12 @@ export default function ChatPage() {
               disabled={isLoading || !inputValue.trim()}
               style={{
                 ...styles.sendButton,
-                backgroundColor:
-                  isLoading || !inputValue.trim()
-                    ? "#b0c4de"
-                    : prdDetected
-                      ? "#722ed1"
-                      : "#1890ff",
+                backgroundColor: buttonColor,
                 cursor:
                   isLoading || !inputValue.trim() ? "not-allowed" : "pointer",
               }}
             >
-              {isLoading
-                ? isPRDGenerating
-                  ? "生成中..."
-                  : "发送中..."
-                : prdDetected
-                  ? "生成PRD"
-                  : "发送"}
+              {buttonLabel}
             </button>
           </div>
         </div>
@@ -314,6 +482,8 @@ const styles: Record<string, CSSProperties> = {
   emptyHint: {
     fontSize: 13,
     color: "#bbb",
+    textAlign: "center",
+    lineHeight: 1.8,
   },
   messageRow: {
     display: "flex",
@@ -365,6 +535,49 @@ const styles: Record<string, CSSProperties> = {
     fontSize: 14,
     borderTop: "1px solid #ffccc7",
   },
+  docListCard: {
+    display: "flex",
+    flexDirection: "column",
+    gap: 6,
+    marginLeft: 46,
+    maxWidth: "70%",
+  },
+  docItem: {
+    display: "flex",
+    alignItems: "center",
+    gap: 10,
+    padding: "10px 14px",
+    backgroundColor: "#fff",
+    border: "1px solid #e5e7eb",
+    borderRadius: 10,
+    textDecoration: "none",
+    color: "#333",
+    transition: "all 0.15s",
+    cursor: "pointer",
+    boxShadow: "0 1px 2px rgba(0,0,0,0.04)",
+  },
+  docIcon: {
+    fontSize: 18,
+    flexShrink: 0,
+  },
+  docName: {
+    flex: 1,
+    fontSize: 14,
+    fontWeight: 500,
+    overflow: "hidden",
+    textOverflow: "ellipsis",
+    whiteSpace: "nowrap" as CSSProperties["whiteSpace"],
+  },
+  docTime: {
+    fontSize: 12,
+    color: "#999",
+    whiteSpace: "nowrap" as CSSProperties["whiteSpace"],
+  },
+  docArrow: {
+    fontSize: 14,
+    color: "#1890ff",
+    flexShrink: 0,
+  },
   savedBanner: {
     display: "flex",
     alignItems: "center",
@@ -375,25 +588,35 @@ const styles: Record<string, CSSProperties> = {
     borderRadius: 8,
     fontSize: 14,
     color: "#389e0d",
+    flexWrap: "wrap" as CSSProperties["flexWrap"],
   },
   savedIcon: {
     fontSize: 16,
+  },
+  previewLink: {
+    marginLeft: "auto",
+    padding: "4px 14px",
+    backgroundColor: "#1890ff",
+    color: "#fff",
+    borderRadius: 6,
+    fontSize: 13,
+    fontWeight: 600,
+    textDecoration: "none",
+    whiteSpace: "nowrap" as CSSProperties["whiteSpace"],
   },
   inputArea: {
     borderTop: "1px solid #e0e0e0",
     backgroundColor: "#fff",
   },
-  prdBadge: {
+  modeBadge: {
     display: "flex",
     alignItems: "center",
     gap: 6,
     padding: "6px 16px",
-    backgroundColor: "#f9f0ff",
-    color: "#722ed1",
     fontSize: 13,
-    borderBottom: "1px solid #efdbff",
+    borderBottom: "1px solid",
   },
-  prdBadgeIcon: {
+  modeBadgeIcon: {
     fontSize: 14,
   },
   inputContainer: {

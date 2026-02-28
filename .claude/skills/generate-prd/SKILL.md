@@ -1,16 +1,37 @@
 ---
 name: generate-prd
-description: Generate PRD (Product Requirements Document) markdown files based on user descriptions. Use when the user mentions keywords like 原型, PRD, 需求文档, 产品文档, 产品需求, 功能设计, or asks to create a product requirements document.
+description: Generate or edit PRD (Product Requirements Document) markdown files. Trigger on "生成/创建/写 + 需求文档/PRD/原型" to generate new docs, or "修改/更新/编辑 + 需求文档/PRD/原型" to open existing docs for editing.
 ---
 
 # Generate PRD Document
 
-When triggered, generate a PRD markdown document following the project template, and save it to the `Docs/` folder.
+Two modes: **create** (generate new PRD) and **edit** (open existing PRD for editing).
 
-## Trigger Keywords
+## Rule 1: Create Mode
 
-Activate this skill when the user's input contains any of:
-原型, PRD, 需求文档, 产品文档, 产品需求, 功能设计, 需求设计, 写个需求, 写个PRD, 生成文档
+Trigger when user's input contains a **create prefix** + **document keyword**.
+
+**Create prefixes**: 生成、创建、新增、新加、写、做、出
+**Document keywords**: 原型、PRD、需求文档、产品文档、产品需求、功能设计、需求设计、需求
+
+Examples: "生成PRD"、"创建需求文档"、"写个产品需求"、"新增一份原型"
+
+**Action**: Generate a new PRD document following the template, save to `Docs/` folder.
+
+## Rule 2: Edit Mode
+
+Trigger when user's input contains an **edit prefix** + **document keyword**.
+
+**Edit prefixes**: 修改、更新、编辑、改、调整、完善
+**Document keywords**: 原型、PRD、需求文档、产品文档、产品需求、功能设计、需求设计、需求
+
+Examples: "修改需求文档"、"更新PRD"、"编辑一下原型"、"完善产品需求"
+
+**Action**:
+1. Fetch the doc list from `/api/docs`
+2. Try to match a document name from the user's input (e.g., "修改用户积分兑换功能需求文档" matches "用户积分兑换功能.md")
+3. If matched: call `/api/update-doc` with `{ filename, instructions }` — AI reads the existing document, applies the modification, streams back the updated content, and saves it to the file automatically
+4. If no document name found in input: show the doc list for manual selection, linking to the browser editor at `/docs/{filename}`
 
 ## Workflow
 
