@@ -8,9 +8,13 @@ import {
   useState,
 } from "react";
 
+type MessageContentBlock =
+  | { type: "text"; text: string }
+  | { type: "image_url"; image_url: { url: string } };
+
 type Message = {
   role: "user" | "assistant";
-  content: string;
+  content: string | MessageContentBlock[];
 };
 
 type DocFile = {
@@ -69,8 +73,12 @@ export default function ChatPage() {
   const [savedPath, setSavedPath] = useState<string | null>(null);
   const [activeMode, setActiveMode] = useState<InputMode>("chat");
   const [docList, setDocList] = useState<DocFile[] | null>(null);
+  const [selectedImages, setSelectedImages] = useState<
+    { id: string; url: string }[]
+  >([]);
 
   const messagesEndRef = useRef<HTMLDivElement>(null);
+  const fileInputRef = useRef<HTMLInputElement>(null);
 
   const currentMode = useMemo(() => detectMode(inputValue), [inputValue]);
 
@@ -194,31 +202,44 @@ export default function ChatPage() {
   };
 
   const sendMessage = async () => {
-    const content = inputValue.trim();
-    if (!content || isLoading) return;
+    const text = inputValue.trim();
+    const hasImages = selectedImages.length > 0;
+    if ((!text && !hasImages) || isLoading) return;
 
     setError("");
     setSavedPath(null);
     setDocList(null);
 
-    const mode = detectMode(content);
+    const mode = text ? detectMode(text) : "chat";
 
     if (mode === "edit") {
-      return handleEditMode(content);
+      setSelectedImages([]);
+      return handleEditMode(text);
     }
 
     const isPRD = mode === "create";
 
-    const newUserMessage: Message = { role: "user", content };
+    const userContent: string | MessageContentBlock[] = hasImages
+      ? [
+          ...(text ? [{ type: "text" as const, text }] : []),
+          ...selectedImages.map(({ url }) => ({
+            type: "image_url" as const,
+            image_url: { url },
+          })),
+        ]
+      : text;
+
+    const newUserMessage: Message = { role: "user", content: userContent };
     const newMessages = [...messages, newUserMessage];
     setMessages(newMessages);
     setInputValue("");
+    setSelectedImages([]);
     setIsLoading(true);
     if (isPRD) setActiveMode("create");
 
     try {
       const url = isPRD ? "/api/generate-prd" : "/api/chat";
-      const body = isPRD ? { description: content } : { messages: newMessages };
+      const body = isPRD ? { description: text } : { messages: newMessages };
 
       await streamResponse(url, body, (fullText) => {
         if (isPRD) {
@@ -243,16 +264,85 @@ export default function ChatPage() {
     }
   };
 
-  const renderMessageContent = (msg: Message) => {
-    const display =
-      msg.role === "assistant" ? stripMarkers(msg.content) : msg.content;
+  const handleImageSelect = (e: React.ChangeEvent<HTMLInputElement>) => {
+    const files = Array.from(e.target.files || []);
+    for (const file of files) addImageFile(file);
+    e.target.value = "";
+  };
 
-    if (!display && msg.role === "assistant" && isLoading) {
-      if (activeMode === "create") return "正在生成PRD文档...";
-      if (activeMode === "edit") return "正在修改文档...";
-      return "思考中...";
+  const addImageFile = (file: File) => {
+    const reader = new FileReader();
+    reader.onload = (ev) => {
+      const url = ev.target?.result as string;
+      const id = `${Date.now()}-${Math.random().toString(36).slice(2)}`;
+      setSelectedImages((prev) => [...prev, { id, url }]);
+    };
+    reader.readAsDataURL(file);
+  };
+
+  const handlePaste = (e: React.ClipboardEvent) => {
+    const items = Array.from(e.clipboardData.items);
+    const imageItems = items.filter((item) => item.type.startsWith("image/"));
+    if (imageItems.length === 0) return;
+    e.preventDefault();
+    for (const item of imageItems) {
+      const file = item.getAsFile();
+      if (file) addImageFile(file);
     }
-    return display;
+  };
+
+  const removeImage = (id: string) => {
+    setSelectedImages((prev) => prev.filter((img) => img.id !== id));
+  };
+
+  const renderMessageContent = (msg: Message) => {
+    if (msg.role === "assistant") {
+      const text = typeof msg.content === "string" ? msg.content : "";
+      const display = stripMarkers(text);
+      if (!display && isLoading) {
+        if (activeMode === "create") return "正在生成PRD文档...";
+        if (activeMode === "edit") return "正在修改文档...";
+        return "思考中...";
+      }
+      return display;
+    }
+
+    if (typeof msg.content === "string") return msg.content;
+
+    return (
+      <div style={{ display: "flex", flexDirection: "column", gap: 8 }}>
+        {msg.content.map((block) => {
+          if (block.type === "text") {
+            return block.text ? (
+              <span
+                key={`text-${block.text.slice(0, 32)}`}
+                style={{ whiteSpace: "pre-wrap" }}
+              >
+                {block.text}
+              </span>
+            ) : null;
+          }
+          if (block.type === "image_url") {
+            const urlKey = block.image_url.url.slice(-32);
+            return (
+              <img
+                key={`img-${urlKey}`}
+                src={block.image_url.url}
+                alt="图片"
+                style={{
+                  maxWidth: "100%",
+                  maxHeight: 300,
+                  borderRadius: 8,
+                  objectFit: "contain",
+                  display: "block",
+                }}
+              />
+            );
+          }
+          return null;
+        })}
+      </div>
+    );
   };
 
   const badgeConfig: Record<
@@ -288,8 +378,10 @@ export default function ChatPage() {
         ? "AI修改"
         : "发送";
 
+  const isInputEmpty = !inputValue.trim() && selectedImages.length === 0;
+
   const buttonColor =
-    isLoading || !inputValue.trim()
+    isLoading || isInputEmpty
       ? "#b0c4de"
       : currentMode === "create"
         ? "#722ed1"
@@ -406,24 +498,68 @@ export default function ChatPage() {
             </div>
           )}
           <div style={styles.inputContainer}>
-            <textarea
-              value={inputValue}
-              onChange={(e) => setInputValue(e.target.value)}
-              onKeyDown={handleKeyDown}
-              placeholder="输入消息，按回车发送（Shift+Enter换行）..."
-              disabled={isLoading}
-              style={styles.textarea}
-              rows={1}
+            <div style={styles.inputWrapper}>
+              {selectedImages.length > 0 && (
+                <div style={styles.imagePreviewArea}>
+                  {selectedImages.map((img) => (
+                    <div key={img.id} style={styles.imagePreviewItem}>
+                      <img
+                        src={img.url}
+                        alt="预览"
+                        style={styles.imagePreviewThumb}
+                      />
+                      <button
+                        type="button"
+                        onClick={() => removeImage(img.id)}
+                        style={styles.imageRemoveButton}
+                        title="移除图片"
+                      >
+                        ×
+                      </button>
+                    </div>
+                  ))}
+                </div>
+              )}
+              <textarea
+                value={inputValue}
+                onChange={(e) => setInputValue(e.target.value)}
+                onKeyDown={handleKeyDown}
+                onPaste={handlePaste}
+                placeholder="输入消息，按回车发送（Shift+Enter换行）..."
+                disabled={isLoading}
+                style={styles.textarea}
+                rows={1}
+              />
+            </div>
+            <input
+              ref={fileInputRef}
+              type="file"
+              accept="image/*"
+              multiple
+              style={{ display: "none" }}
+              onChange={handleImageSelect}
             />
             <button
               type="button"
+              onClick={() => fileInputRef.current?.click()}
+              disabled={isLoading}
+              style={{
+                ...styles.uploadButton,
+                cursor: isLoading ? "not-allowed" : "pointer",
+                opacity: isLoading ? 0.5 : 1,
+              }}
+              title="上传图片"
+            >
+              🖼
+            </button>
+            <button
+              type="button"
               onClick={sendMessage}
-              disabled={isLoading || !inputValue.trim()}
+              disabled={isLoading || isInputEmpty}
               style={{
                 ...styles.sendButton,
                 backgroundColor: buttonColor,
-                cursor:
-                  isLoading || !inputValue.trim() ? "not-allowed" : "pointer",
+                cursor: isLoading || isInputEmpty ? "not-allowed" : "pointer",
               }}
             >
               {buttonLabel}
@@ -623,19 +759,76 @@ const styles: Record<string, CSSProperties> = {
     display: "flex",
     gap: 10,
     padding: 16,
+    alignItems: "flex-end",
+  },
+  inputWrapper: {
+    flex: 1,
+    display: "flex",
+    flexDirection: "column",
+    border: "1px solid #d9d9d9",
+    borderRadius: 8,
+    overflow: "hidden",
+    backgroundColor: "#fff",
+  },
+  imagePreviewArea: {
+    display: "flex",
+    flexWrap: "wrap" as CSSProperties["flexWrap"],
+    gap: 8,
+    padding: "8px 10px 4px",
+  },
+  imagePreviewItem: {
+    position: "relative" as CSSProperties["position"],
+    display: "inline-block",
+  },
+  imagePreviewThumb: {
+    width: 60,
+    height: 60,
+    objectFit: "cover" as CSSProperties["objectFit"],
+    borderRadius: 6,
+    border: "1px solid #e0e0e0",
+    display: "block",
+  },
+  imageRemoveButton: {
+    position: "absolute" as CSSProperties["position"],
+    top: -6,
+    right: -6,
+    width: 18,
+    height: 18,
+    borderRadius: "50%",
+    backgroundColor: "#ff4d4f",
+    color: "#fff",
+    border: "none",
+    cursor: "pointer",
+    display: "flex",
+    alignItems: "center",
+    justifyContent: "center",
+    fontSize: 13,
+    lineHeight: 1,
+    padding: 0,
+    fontWeight: 700,
   },
   textarea: {
     flex: 1,
     padding: "10px 14px",
-    border: "1px solid #d9d9d9",
-    borderRadius: 8,
-    fontSize: 15,
+    border: "none",
     outline: "none",
     resize: "none" as CSSProperties["resize"],
     fontFamily: "inherit",
+    fontSize: 15,
     lineHeight: 1.5,
     minHeight: 20,
     maxHeight: 120,
+    backgroundColor: "transparent",
+  },
+  uploadButton: {
+    padding: "10px 12px",
+    border: "1px solid #d9d9d9",
+    borderRadius: 8,
+    backgroundColor: "#fff",
+    fontSize: 18,
+    alignSelf: "flex-end",
+    lineHeight: 1,
+    transition: "background-color 0.2s",
   },
   sendButton: {
     padding: "10px 24px",

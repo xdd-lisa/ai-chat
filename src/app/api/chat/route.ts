@@ -19,8 +19,12 @@ export async function POST(req: Request) {
       return errorResponse("参数错误，messages必须是数组", 400);
     }
 
+    type ContentBlock =
+      | { type: "text"; text: string }
+      | { type: "image_url"; image_url: { url: string } };
+
     const chatMessages = messages.map(
-      (msg: { role: string; content: string }) => ({
+      (msg: { role: string; content: string | ContentBlock[] }) => ({
         role: msg.role === "assistant" ? "assistant" : "user",
         content: msg.content,
       }),
